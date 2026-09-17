@@ -1,524 +1,344 @@
 #include "PluginEditor.h"
-#include "Params/ParameterIDs.h"
-#include "DSP/WavetableFactory.h"
-#include "DSP/Filter.h"
-#include "DSP/LFO.h"
-#include "DSP/ModulationMatrix.h"
+#include "ParameterIDs.h"
 
-namespace
+// ==================== InfoDisplay ====================
+
+void PPGWave3Editor::InfoDisplay::setInfo (const juce::String& name, const juce::String& value)
 {
-    void setupRotarySlider (juce::Slider& slider, juce::Label& label, const juce::String& labelText,
-                             juce::Component& parent)
-    {
-        slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-        slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 64, 18);
-        parent.addAndMakeVisible (slider);
+    paramName  = name;
+    paramValue = value;
+    repaint();
+}
 
-        label.setText (labelText, juce::dontSendNotification);
-        label.setJustificationType (juce::Justification::centred);
-        label.setFont (juce::Font (12.0f));
-        parent.addAndMakeVisible (label);
+void PPGWave3Editor::InfoDisplay::paint (juce::Graphics& g)
+{
+    auto r = getLocalBounds().toFloat();
+    g.setColour (juce::Colour (0xff0a0a0a));
+    g.fillRoundedRectangle (r, 3.0f);
+    g.setColour (juce::Colour (0xffffaa00));
+    g.drawRoundedRectangle (r.reduced (0.5f), 3.0f, 1.0f);
+
+    auto textArea = getLocalBounds().reduced (5, 1);
+    g.setColour (juce::Colour (0xffffcc55));
+    g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(),
+                                  9.5f, juce::Font::plain));
+
+    if (paramValue.isEmpty())
+    {
+        g.drawText (paramName, textArea, juce::Justification::centredLeft);
     }
-
-    void layoutKnobRow (juce::Rectangle<int> row, const std::vector<std::pair<juce::Slider*, juce::Label*>>& knobs)
+    else
     {
-        if (knobs.empty())
-            return;
+        auto nameArea = textArea.removeFromLeft ((int) (textArea.getWidth() * 0.55f));
+        g.drawText (paramName,  nameArea, juce::Justification::centredLeft);
+        g.drawText (paramValue, textArea, juce::Justification::centredRight);
+    }
+}
 
-        const int knobWidth = row.getWidth() / (int) knobs.size();
-        for (auto& knob : knobs)
+// ==================== RotaryKnob ====================
+
+PPGWave3Editor::RotaryKnob::RotaryKnob (juce::AudioProcessorValueTreeState& state,
+                                        const juce::String& paramID,
+                                        const juce::String& labelText,
+                                        InfoDisplay* display)
+    : infoDisplay (display), paramName (labelText)
+{
+    slider.setSliderStyle (juce::Slider::RotaryVerticalDrag);
+    slider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+    slider.setColour (juce::Slider::rotarySliderFillColourId,    juce::Colour (0xffffaa00));
+    slider.setColour (juce::Slider::rotarySliderOutlineColourId, juce::Colour (0xff333333));
+    slider.setColour (juce::Slider::thumbColourId,               juce::Colour (0xffffcc55));
+
+    slider.onValueChange = [this]()
+    {
+        if (infoDisplay != nullptr)
+            infoDisplay->setInfo (paramName, slider.getTextFromValue (slider.getValue()));
+    };
+
+    addAndMakeVisible (slider);
+
+    label.setText (labelText, juce::dontSendNotification);
+    label.setJustificationType (juce::Justification::centred);
+    label.setColour (juce::Label::textColourId, juce::Colour (0xffcccccc));
+    label.setFont (juce::FontOptions (9.5f));
+    addAndMakeVisible (label);
+
+    attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        state, paramID, slider);
+}
+
+void PPGWave3Editor::RotaryKnob::resized()
+{
+    auto r = getLocalBounds();
+    label.setBounds (r.removeFromTop (11));
+    slider.setBounds (r.reduced (2, 0));
+}
+
+void PPGWave3Editor::RotaryKnob::paint (juce::Graphics&) {}
+
+// ==================== ButtonSelector ====================
+
+PPGWave3Editor::ButtonSelector::ButtonSelector (juce::AudioProcessorValueTreeState& state,
+                                                const juce::String& paramID,
+                                                const juce::StringArray& names)
+    : apvtsRef (state), id (paramID)
+{
+    for (int i = 0; i < names.size(); ++i)
+    {
+        auto* b = buttons.add (new juce::TextButton (names[i]));
+        b->setClickingTogglesState (false);
+        b->setColour (juce::TextButton::buttonColourId,   juce::Colour (0xff2a2a2a));
+        b->setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffffaa00));
+        b->setColour (juce::TextButton::textColourOffId,  juce::Colour (0xffcccccc));
+        b->setColour (juce::TextButton::textColourOnId,   juce::Colours::black);
+        b->onClick = [this, i]()
         {
-            auto slot = row.removeFromLeft (knobWidth);
-            knob.first->setBounds (slot.removeFromTop (80).reduced (6, 0));
-            knob.second->setBounds (slot);
-        }
+            if (attachment)
+                attachment->setValueAsCompleteGesture ((float) i);
+        };
+        addAndMakeVisible (b);
     }
-}
 
-PPGWaveCloneAudioProcessorEditor::PPGWaveCloneAudioProcessorEditor (PPGWaveCloneAudioProcessor& p)
-    : AudioProcessorEditor (&p), processorRef (p)
-{
-    titleLabel.setText ("PPG WAVE CLONE - Fase 6", juce::dontSendNotification);
-    titleLabel.setJustificationType (juce::Justification::centred);
-    titleLabel.setFont (juce::Font (18.0f, juce::Font::bold));
-    addAndMakeVisible (titleLabel);
-
-    setupRotarySlider (masterVolumeSlider, masterVolumeLabel, "Master Volume", *this);
-    masterVolumeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::masterVolume, masterVolumeSlider);
-
-    setupOscillatorControls (osc1Controls, 1);
-    setupOscillatorControls (osc2Controls, 2);
-
-    setupFilterControls();
-    setupEnvelopeControls (env1Controls, 1, "ENV 1 (AMP)");
-    setupEnvelopeControls (env2Controls, 2, "ENV 2 (FILTER)");
-
-    setupLFOControls (lfo1Controls, 1);
-    setupLFOControls (lfo2Controls, 2);
-
-    modMatrixTitle.setText ("MODULATION MATRIX", juce::dontSendNotification);
-    modMatrixTitle.setJustificationType (juce::Justification::centred);
-    modMatrixTitle.setFont (juce::Font (14.0f, juce::Font::bold));
-    addAndMakeVisible (modMatrixTitle);
-
-    for (int i = 0; i < 4; ++i)
-        setupModSlotControls (modSlotControls[(size_t) i], i + 1);
-
-    setupEffectControls (driveControls, "DRIVE", ParamIDs::driveEnabled,
-                          ParamIDs::driveAmount, "Amount", ParamIDs::driveTone, "Tone", ParamIDs::driveMix, "Mix");
-    setupEffectControls (chorusControls, "CHORUS", ParamIDs::chorusEnabled,
-                          ParamIDs::chorusRate, "Rate", ParamIDs::chorusDepth, "Depth", ParamIDs::chorusMix, "Mix");
-    setupEffectControls (delayControls, "DELAY", ParamIDs::delayEnabled,
-                          ParamIDs::delayTime, "Time", ParamIDs::delayFeedback, "Feedback", ParamIDs::delayMix, "Mix");
-    setupEffectControls (reverbControls, "REVERB", ParamIDs::reverbEnabled,
-                          ParamIDs::reverbSize, "Size", ParamIDs::reverbDamping, "Damping", ParamIDs::reverbMix, "Mix");
-
-    setupPresetBar();
-
-    setSize (900, 1100);
-}
-
-void PPGWaveCloneAudioProcessorEditor::setupOscillatorControls (OscillatorControls& controls, int oscNumber)
-{
-    controls.title.setText ("OSCILLATOR " + juce::String (oscNumber), juce::dontSendNotification);
-    controls.title.setJustificationType (juce::Justification::centred);
-    controls.title.setFont (juce::Font (14.0f, juce::Font::bold));
-    addAndMakeVisible (controls.title);
-
-    controls.wavetableBox.addItemList (WavetableFactory::getDefaultWavetableNames(), 1);
-    addAndMakeVisible (controls.wavetableBox);
-    controls.wavetableAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
-        processorRef.apvts, ParamIDs::oscWavetableIndex (oscNumber), controls.wavetableBox);
-
-    setupRotarySlider (controls.positionSlider, controls.positionLabel, "Position", *this);
-    controls.positionAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::oscWavePosition (oscNumber), controls.positionSlider);
-
-    setupRotarySlider (controls.octaveSlider, controls.octaveLabel, "Octave", *this);
-    controls.octaveAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::oscOctave (oscNumber), controls.octaveSlider);
-
-    setupRotarySlider (controls.coarseSlider, controls.coarseLabel, "Coarse", *this);
-    controls.coarseAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::oscCoarseTune (oscNumber), controls.coarseSlider);
-
-    setupRotarySlider (controls.fineSlider, controls.fineLabel, "Fine", *this);
-    controls.fineAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::oscFineTune (oscNumber), controls.fineSlider);
-
-    setupRotarySlider (controls.levelSlider, controls.levelLabel, "Level", *this);
-    controls.levelAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::oscLevel (oscNumber), controls.levelSlider);
-}
-
-void PPGWaveCloneAudioProcessorEditor::setupFilterControls()
-{
-    filterControls.title.setText ("FILTER", juce::dontSendNotification);
-    filterControls.title.setJustificationType (juce::Justification::centred);
-    filterControls.title.setFont (juce::Font (14.0f, juce::Font::bold));
-    addAndMakeVisible (filterControls.title);
-
-    filterControls.typeBox.addItemList (FilterTypeChoices::getNames(), 1);
-    addAndMakeVisible (filterControls.typeBox);
-    filterControls.typeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
-        processorRef.apvts, ParamIDs::filterType, filterControls.typeBox);
-
-    setupRotarySlider (filterControls.cutoffSlider, filterControls.cutoffLabel, "Cutoff", *this);
-    filterControls.cutoffAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::filterCutoff, filterControls.cutoffSlider);
-
-    setupRotarySlider (filterControls.resonanceSlider, filterControls.resonanceLabel, "Resonance", *this);
-    filterControls.resonanceAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::filterResonance, filterControls.resonanceSlider);
-
-    setupRotarySlider (filterControls.keyTrackSlider, filterControls.keyTrackLabel, "Key Track", *this);
-    filterControls.keyTrackAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::filterKeyTrack, filterControls.keyTrackSlider);
-
-    setupRotarySlider (filterControls.envAmountSlider, filterControls.envAmountLabel, "Env Amount", *this);
-    filterControls.envAmountAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::filterEnvAmount, filterControls.envAmountSlider);
-}
-
-void PPGWaveCloneAudioProcessorEditor::setupEnvelopeControls (EnvelopeControls& controls, int envNumber,
-                                                                const juce::String& titleText)
-{
-    controls.title.setText (titleText, juce::dontSendNotification);
-    controls.title.setJustificationType (juce::Justification::centred);
-    controls.title.setFont (juce::Font (14.0f, juce::Font::bold));
-    addAndMakeVisible (controls.title);
-
-    setupRotarySlider (controls.attackSlider, controls.attackLabel, "Attack", *this);
-    controls.attackAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::envAttack (envNumber), controls.attackSlider);
-
-    setupRotarySlider (controls.decaySlider, controls.decayLabel, "Decay", *this);
-    controls.decayAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::envDecay (envNumber), controls.decaySlider);
-
-    setupRotarySlider (controls.sustainSlider, controls.sustainLabel, "Sustain", *this);
-    controls.sustainAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::envSustain (envNumber), controls.sustainSlider);
-
-    setupRotarySlider (controls.releaseSlider, controls.releaseLabel, "Release", *this);
-    controls.releaseAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::envRelease (envNumber), controls.releaseSlider);
-}
-
-void PPGWaveCloneAudioProcessorEditor::setupLFOControls (LFOControls& controls, int lfoNumber)
-{
-    controls.title.setText ("LFO " + juce::String (lfoNumber), juce::dontSendNotification);
-    controls.title.setJustificationType (juce::Justification::centred);
-    controls.title.setFont (juce::Font (14.0f, juce::Font::bold));
-    addAndMakeVisible (controls.title);
-
-    controls.waveformBox.addItemList (LFOWaveformChoices::getNames(), 1);
-    addAndMakeVisible (controls.waveformBox);
-    controls.waveformAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
-        processorRef.apvts, ParamIDs::lfoWaveform (lfoNumber), controls.waveformBox);
-
-    setupRotarySlider (controls.rateSlider, controls.rateLabel, "Rate", *this);
-    controls.rateAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::lfoRate (lfoNumber), controls.rateSlider);
-
-    setupRotarySlider (controls.phaseSlider, controls.phaseLabel, "Phase", *this);
-    controls.phaseAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::lfoPhase (lfoNumber), controls.phaseSlider);
-
-    setupRotarySlider (controls.depthSlider, controls.depthLabel, "Depth", *this);
-    controls.depthAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::lfoDepth (lfoNumber), controls.depthSlider);
-}
-
-void PPGWaveCloneAudioProcessorEditor::setupModSlotControls (ModSlotControls& controls, int slotNumber)
-{
-    controls.sourceBox.addItemList (ModulationSources::getNames(), 1);
-    addAndMakeVisible (controls.sourceBox);
-    controls.sourceAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
-        processorRef.apvts, ParamIDs::modSlotSource (slotNumber), controls.sourceBox);
-
-    controls.destinationBox.addItemList (ModulationDestinations::getNames(), 1);
-    addAndMakeVisible (controls.destinationBox);
-    controls.destinationAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
-        processorRef.apvts, ParamIDs::modSlotDestination (slotNumber), controls.destinationBox);
-
-    controls.amountSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    controls.amountSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 50, 20);
-    addAndMakeVisible (controls.amountSlider);
-    controls.amountAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamIDs::modSlotAmount (slotNumber), controls.amountSlider);
-}
-
-void PPGWaveCloneAudioProcessorEditor::setupEffectControls (EffectControls& controls, const juce::String& titleText,
-                                                              const juce::String& enableParamID,
-                                                              const juce::String& knob1ParamID, const juce::String& knob1Text,
-                                                              const juce::String& knob2ParamID, const juce::String& knob2Text,
-                                                              const juce::String& knob3ParamID, const juce::String& knob3Text)
-{
-    controls.title.setText (titleText, juce::dontSendNotification);
-    controls.title.setJustificationType (juce::Justification::centred);
-    controls.title.setFont (juce::Font (14.0f, juce::Font::bold));
-    addAndMakeVisible (controls.title);
-
-    controls.enableButton.setButtonText ("On");
-    addAndMakeVisible (controls.enableButton);
-    controls.enableAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
-        processorRef.apvts, enableParamID, controls.enableButton);
-
-    setupRotarySlider (controls.knob1Slider, controls.knob1Label, knob1Text, *this);
-    controls.knob1Attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, knob1ParamID, controls.knob1Slider);
-
-    setupRotarySlider (controls.knob2Slider, controls.knob2Label, knob2Text, *this);
-    controls.knob2Attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, knob2ParamID, controls.knob2Slider);
-
-    setupRotarySlider (controls.knob3Slider, controls.knob3Label, knob3Text, *this);
-    controls.knob3Attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, knob3ParamID, controls.knob3Slider);
-}
-
-void PPGWaveCloneAudioProcessorEditor::setupPresetBar()
-{
-    addAndMakeVisible (presetComboBox);
-    presetComboBox.onChange = [this]
-    {
-        const int id = presetComboBox.getSelectedId();
-        if (id <= 0)
-            return;
-
-        processorRef.presetManager.loadPreset (id - 1);
-        updateFavoriteButtonState();
-        presetDeleteButton.setEnabled (! processorRef.presetManager.getPresetInfo (id - 1).isFactory);
-    };
-
-    addAndMakeVisible (presetPrevButton);
-    presetPrevButton.onClick = [this]
-    {
-        processorRef.presetManager.loadPrevious();
-        refreshPresetComboBox();
-    };
-
-    addAndMakeVisible (presetNextButton);
-    presetNextButton.onClick = [this]
-    {
-        processorRef.presetManager.loadNext();
-        refreshPresetComboBox();
-    };
-
-    addAndMakeVisible (presetRandomButton);
-    presetRandomButton.onClick = [this]
-    {
-        processorRef.presetManager.loadRandom();
-        refreshPresetComboBox();
-    };
-
-    addAndMakeVisible (presetFavoriteButton);
-    presetFavoriteButton.onClick = [this]
-    {
-        auto& manager = processorRef.presetManager;
-        manager.toggleFavorite (manager.getPresetInfo (manager.getCurrentIndex()).name);
-        updateFavoriteButtonState();
-    };
-
-    addAndMakeVisible (presetSaveButton);
-    presetSaveButton.onClick = [this] { onSaveButtonClicked(); };
-
-    addAndMakeVisible (presetDeleteButton);
-    presetDeleteButton.onClick = [this]
-    {
-        processorRef.presetManager.deleteCurrentPresetIfUser();
-        refreshPresetComboBox();
-    };
-
-    refreshPresetComboBox();
-}
-
-void PPGWaveCloneAudioProcessorEditor::refreshPresetComboBox()
-{
-    auto& manager = processorRef.presetManager;
-
-    presetComboBox.clear (juce::dontSendNotification);
-    presetComboBox.addSectionHeading ("FACTORY");
-    bool addedUserHeading = false;
-
-    for (int i = 0; i < manager.getNumPresets(); ++i)
-    {
-        const auto& info = manager.getPresetInfo (i);
-        if (! info.isFactory && ! addedUserHeading)
+    attachment = std::make_unique<juce::ParameterAttachment> (
+        *apvtsRef.getParameter (id),
+        [this] (float newValue)
         {
-            presetComboBox.addSectionHeading ("USER");
-            addedUserHeading = true;
-        }
-        presetComboBox.addItem (info.name + "  [" + info.category + "]", i + 1);
-    }
-
-    if (manager.getNumPresets() > 0)
-        presetComboBox.setSelectedId (manager.getCurrentIndex() + 1, juce::dontSendNotification);
-
-    updateFavoriteButtonState();
-    presetDeleteButton.setEnabled (manager.getNumPresets() > 0
-        && ! manager.getPresetInfo (manager.getCurrentIndex()).isFactory);
+            currentIndex = (int) newValue;
+            refreshFromParameter();
+        });
+    attachment->sendInitialUpdate();
 }
 
-void PPGWaveCloneAudioProcessorEditor::updateFavoriteButtonState()
+void PPGWave3Editor::ButtonSelector::refreshFromParameter()
 {
-    auto& manager = processorRef.presetManager;
-    if (manager.getNumPresets() == 0)
-        return;
-
-    const bool fav = manager.isFavorite (manager.getPresetInfo (manager.getCurrentIndex()).name);
-    presetFavoriteButton.setButtonText (fav ? "* Fav" : "Fav");
+    for (int i = 0; i < buttons.size(); ++i)
+        buttons[i]->setToggleState (i == currentIndex, juce::dontSendNotification);
 }
 
-void PPGWaveCloneAudioProcessorEditor::onSaveButtonClicked()
+void PPGWave3Editor::ButtonSelector::resized()
 {
-    saveNameWindow = std::make_unique<juce::AlertWindow> ("Guardar preset", "Nombre del preset:",
-                                                           juce::MessageBoxIconType::NoIcon);
-    saveNameWindow->addTextEditor ("name", "", "Nombre:");
-    saveNameWindow->addButton ("Guardar", 1, juce::KeyPress (juce::KeyPress::returnKey));
-    saveNameWindow->addButton ("Cancelar", 0, juce::KeyPress (juce::KeyPress::escapeKey));
-
-    juce::Component::SafePointer<PPGWaveCloneAudioProcessorEditor> safeThis (this);
-
-    saveNameWindow->enterModalState (true, juce::ModalCallbackFunction::create (
-        [safeThis] (int result)
-        {
-            if (safeThis == nullptr)
-                return;
-
-            if (result == 1)
-            {
-                const auto name = safeThis->saveNameWindow->getTextEditorContents ("name");
-                safeThis->processorRef.presetManager.saveUserPreset (name, "User");
-                safeThis->refreshPresetComboBox();
-            }
-
-            safeThis->saveNameWindow.reset();
-        }));
+    auto r = getLocalBounds();
+    const int w = r.getWidth() / juce::jmax (1, buttons.size());
+    for (auto* b : buttons)
+        b->setBounds (r.removeFromLeft (w).reduced (1));
 }
 
-void PPGWaveCloneAudioProcessorEditor::paint (juce::Graphics& g)
+void PPGWave3Editor::ButtonSelector::paint (juce::Graphics&) {}
+
+// ==================== Editor ====================
+
+PPGWave3Editor::PPGWave3Editor (PPGWave3Processor& p)
+    : AudioProcessorEditor (&p),
+      processorRef (p),
+      apvts (p.apvts),
+      osc1Wave (std::make_unique<ButtonSelector> (p.apvts, ParamIDs::osc1Wave,
+                  juce::StringArray { "SIN", "TRI", "SAW", "SQR" })),
+      osc1Pos   (p.apvts, ParamIDs::osc1Pos,    "POS",    &osc1Info),
+      osc1Oct   (p.apvts, ParamIDs::osc1Octave, "OCT",    &osc1Info),
+      osc1Semi  (p.apvts, ParamIDs::osc1Semi,   "SEMI",   &osc1Info),
+      osc1Fine  (p.apvts, ParamIDs::osc1Fine,   "FINE",   &osc1Info),
+      osc1Level (p.apvts, ParamIDs::osc1Level,  "LEVEL",  &osc1Info),
+      osc2Wave (std::make_unique<ButtonSelector> (p.apvts, ParamIDs::osc2Wave,
+                  juce::StringArray { "SIN", "TRI", "SAW", "SQR" })),
+      osc2Pos   (p.apvts, ParamIDs::osc2Pos,    "POS",    &osc2Info),
+      osc2Oct   (p.apvts, ParamIDs::osc2Octave, "OCT",    &osc2Info),
+      osc2Semi  (p.apvts, ParamIDs::osc2Semi,   "SEMI",   &osc2Info),
+      osc2Fine  (p.apvts, ParamIDs::osc2Fine,   "FINE",   &osc2Info),
+      osc2Level (p.apvts, ParamIDs::osc2Level,  "LEVEL",  &osc2Info),
+      filterType (std::make_unique<ButtonSelector> (p.apvts, ParamIDs::filterType,
+                    juce::StringArray { "LP", "HP", "BP" })),
+      filterCutoff  (p.apvts, ParamIDs::filterCutoff,   "CUTOFF",  &filterInfo),
+      filterReso    (p.apvts, ParamIDs::filterReso,     "RESO",    &filterInfo),
+      filterEnvAmt  (p.apvts, ParamIDs::filterEnvAmt,   "ENV AMT", &filterInfo),
+      filterKeyTrack(p.apvts, ParamIDs::filterKeyTrack, "KEY TRK", &filterInfo),
+      ampA (p.apvts, ParamIDs::ampAttack,  "A", &ampEnvInfo),
+      ampD (p.apvts, ParamIDs::ampDecay,   "D", &ampEnvInfo),
+      ampS (p.apvts, ParamIDs::ampSustain, "S", &ampEnvInfo),
+      ampR (p.apvts, ParamIDs::ampRelease, "R", &ampEnvInfo),
+      filtA (p.apvts, ParamIDs::filtAttack,  "A", &filtEnvInfo),
+      filtD (p.apvts, ParamIDs::filtDecay,   "D", &filtEnvInfo),
+      filtS (p.apvts, ParamIDs::filtSustain, "S", &filtEnvInfo),
+      filtR (p.apvts, ParamIDs::filtRelease, "R", &filtEnvInfo),
+      master (p.apvts, ParamIDs::masterGain, "MASTER", &masterInfo)
 {
-    g.fillAll (juce::Colour (0xff1a1a1f));
+    juce::ignoreUnused (processorRef, apvts);
+
+    addAndMakeVisible (*osc1Wave);
+    addAndMakeVisible (*osc2Wave);
+    addAndMakeVisible (*filterType);
+
+    // Info displays
+    for (auto* d : { &osc1Info, &osc2Info, &filterInfo,
+                     &ampEnvInfo, &filtEnvInfo, &masterInfo })
+        addAndMakeVisible (d);
+
+    // Perillas
+    std::initializer_list<juce::Component*> allKnobs {
+        &osc1Pos, &osc1Oct, &osc1Semi, &osc1Fine, &osc1Level,
+        &osc2Pos, &osc2Oct, &osc2Semi, &osc2Fine, &osc2Level,
+        &filterCutoff, &filterReso, &filterEnvAmt, &filterKeyTrack,
+        &ampA, &ampD, &ampS, &ampR,
+        &filtA, &filtD, &filtS, &filtR,
+        &master
+    };
+    for (auto* c : allKnobs)
+        addAndMakeVisible (c);
+
+    setResizable (true, true);
+    setResizeLimits (500, 340, 1200, 800);
+    setSize (640, 460);
 }
 
-void PPGWaveCloneAudioProcessorEditor::layoutOscillatorControls (OscillatorControls& controls, juce::Rectangle<int> area)
+void PPGWave3Editor::paint (juce::Graphics& g)
 {
-    controls.title.setBounds (area.removeFromTop (20));
-    controls.wavetableBox.setBounds (area.removeFromTop (24).reduced (20, 0));
-    area.removeFromTop (8);
+    g.fillAll (juce::Colour (0xff151515));
 
-    auto knobRow = area.removeFromTop (110);
-    layoutKnobRow (knobRow, {
-        { &controls.positionSlider, &controls.positionLabel },
-        { &controls.octaveSlider,   &controls.octaveLabel },
-        { &controls.coarseSlider,   &controls.coarseLabel },
-        { &controls.fineSlider,     &controls.fineLabel },
-        { &controls.levelSlider,    &controls.levelLabel },
-    });
+    auto top = getLocalBounds().removeFromTop (22);
+    g.setColour (juce::Colour (0xff0a0a0a));
+    g.fillRect (top);
+    g.setColour (juce::Colour (0xffffaa00));
+    g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
+    g.drawText ("PPG WAVE 3 CLONE   /   PHASE 3",
+                top.reduced (10, 0), juce::Justification::centredLeft);
+
+    drawSection (g, osc1Area,    "OSCILLATOR 1");
+    drawSection (g, osc2Area,    "OSCILLATOR 2");
+    drawSection (g, filterArea,  "FILTER");
+    drawSection (g, ampEnvArea,  "AMP ENV");
+    drawSection (g, filtEnvArea, "FILTER ENV");
+    drawSection (g, masterArea,  "MASTER");
 }
 
-void PPGWaveCloneAudioProcessorEditor::layoutFilterControls (juce::Rectangle<int> area)
+void PPGWave3Editor::drawSection (juce::Graphics& g, juce::Rectangle<int> area,
+                                  const juce::String& title) const
 {
-    filterControls.title.setBounds (area.removeFromTop (20));
-    filterControls.typeBox.setBounds (area.removeFromTop (24).reduced (10, 0));
-    area.removeFromTop (8);
-
-    auto knobRow = area.removeFromTop (110);
-    layoutKnobRow (knobRow, {
-        { &filterControls.cutoffSlider,    &filterControls.cutoffLabel },
-        { &filterControls.resonanceSlider, &filterControls.resonanceLabel },
-        { &filterControls.keyTrackSlider,  &filterControls.keyTrackLabel },
-        { &filterControls.envAmountSlider, &filterControls.envAmountLabel },
-    });
+    if (area.isEmpty()) return;
+    g.setColour (juce::Colour (0xff2a2a2a));
+    g.drawRoundedRectangle (area.toFloat().reduced (0.5f), 4.0f, 1.0f);
+    g.setColour (juce::Colour (0xffffaa00));
+    g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
+    g.drawText (title, area.getX() + 8, area.getY() + 3, 200, 12,
+                juce::Justification::centredLeft);
 }
 
-void PPGWaveCloneAudioProcessorEditor::layoutEnvelopeControls (EnvelopeControls& controls, juce::Rectangle<int> area)
+void PPGWave3Editor::resized()
 {
-    controls.title.setBounds (area.removeFromTop (20));
-    area.removeFromTop (32); // alinea con paneles que sí tienen combo box
+    auto r = getLocalBounds();
+    r.removeFromTop (26);
+    r.reduce (6, 6);
 
-    auto knobRow = area.removeFromTop (110);
-    layoutKnobRow (knobRow, {
-        { &controls.attackSlider,  &controls.attackLabel },
-        { &controls.decaySlider,   &controls.decayLabel },
-        { &controls.sustainSlider, &controls.sustainLabel },
-        { &controls.releaseSlider, &controls.releaseLabel },
-    });
-}
+    const int h = r.getHeight();
+    const int gap = 5;
+    const int oscH  = (int) ((h - 3 * gap) * 0.21f);
+    const int filtH = (int) ((h - 3 * gap) * 0.21f);
+    const int envH  = h - 2 * oscH - filtH - 3 * gap;
 
-void PPGWaveCloneAudioProcessorEditor::layoutLFOControls (LFOControls& controls, juce::Rectangle<int> area)
-{
-    controls.title.setBounds (area.removeFromTop (20));
-    controls.waveformBox.setBounds (area.removeFromTop (24).reduced (20, 0));
-    area.removeFromTop (8);
+    osc1Area = r.removeFromTop (oscH);
+    r.removeFromTop (gap);
+    osc2Area = r.removeFromTop (oscH);
+    r.removeFromTop (gap);
+    filterArea = r.removeFromTop (filtH);
+    r.removeFromTop (gap);
 
-    auto knobRow = area.removeFromTop (110);
-    layoutKnobRow (knobRow, {
-        { &controls.rateSlider,  &controls.rateLabel },
-        { &controls.phaseSlider, &controls.phaseLabel },
-        { &controls.depthSlider, &controls.depthLabel },
-    });
-}
+    auto bottomRow = r.removeFromTop (envH);
+    const int totalW = bottomRow.getWidth();
+    const int masterW = (int) (totalW * 0.14f);
+    const int envW = (totalW - masterW - 2 * gap) / 2;
+    ampEnvArea  = bottomRow.removeFromLeft (envW);
+    bottomRow.removeFromLeft (gap);
+    filtEnvArea = bottomRow.removeFromLeft (envW);
+    bottomRow.removeFromLeft (gap);
+    masterArea  = bottomRow;
 
-void PPGWaveCloneAudioProcessorEditor::layoutModSlotControls (ModSlotControls& controls, juce::Rectangle<int> area)
-{
-    auto row = area.reduced (0, 2);
-    const int comboWidth = row.getWidth() / 3;
-    controls.sourceBox.setBounds (row.removeFromLeft (comboWidth).reduced (4, 0));
-    controls.destinationBox.setBounds (row.removeFromLeft (comboWidth).reduced (4, 0));
-    controls.amountSlider.setBounds (row.reduced (4, 0));
-}
-
-void PPGWaveCloneAudioProcessorEditor::layoutEffectControls (EffectControls& controls, juce::Rectangle<int> area)
-{
-    controls.title.setBounds (area.removeFromTop (20));
-    controls.enableButton.setBounds (area.removeFromTop (24).withSizeKeepingCentre (60, 20));
-    area.removeFromTop (8);
-
-    auto knobRow = area.removeFromTop (110);
-    layoutKnobRow (knobRow, {
-        { &controls.knob1Slider, &controls.knob1Label },
-        { &controls.knob2Slider, &controls.knob2Label },
-        { &controls.knob3Slider, &controls.knob3Label },
-    });
-}
-
-void PPGWaveCloneAudioProcessorEditor::layoutPresetBar (juce::Rectangle<int> area)
-{
-    presetPrevButton.setBounds (area.removeFromLeft (28));
-    presetNextButton.setBounds (area.removeFromRight (28));
-    presetDeleteButton.setBounds (area.removeFromRight (70).reduced (4, 0));
-    presetSaveButton.setBounds (area.removeFromRight (70).reduced (4, 0));
-    presetFavoriteButton.setBounds (area.removeFromRight (60).reduced (4, 0));
-    presetRandomButton.setBounds (area.removeFromRight (70).reduced (4, 0));
-    presetComboBox.setBounds (area.reduced (4, 0));
-}
-
-void PPGWaveCloneAudioProcessorEditor::resized()
-{
-    auto area = getLocalBounds().reduced (16);
-
-    layoutPresetBar (area.removeFromTop (28));
-    area.removeFromTop (8);
-
-    titleLabel.setBounds (area.removeFromTop (28));
-    area.removeFromTop (8);
-
-    auto masterArea = area.removeFromTop (110);
-    masterVolumeSlider.setBounds (masterArea.withSizeKeepingCentre (90, 80).translated (0, -10));
-    masterVolumeLabel.setBounds (masterArea.removeFromBottom (18));
-
-    area.removeFromTop (12);
-
-    auto oscRow = area.removeFromTop (162);
-    auto osc1Area = oscRow.removeFromLeft (oscRow.getWidth() / 2).reduced (8, 0);
-    auto osc2Area = oscRow.reduced (8, 0);
-    layoutOscillatorControls (osc1Controls, osc1Area);
-    layoutOscillatorControls (osc2Controls, osc2Area);
-
-    area.removeFromTop (12);
-
-    auto lowerRow = area.removeFromTop (162);
-    const int thirdWidth = lowerRow.getWidth() / 3;
-    auto filterArea = lowerRow.removeFromLeft (thirdWidth).reduced (8, 0);
-    auto env1Area   = lowerRow.removeFromLeft (thirdWidth).reduced (8, 0);
-    auto env2Area   = lowerRow.reduced (8, 0);
-    layoutFilterControls (filterArea);
-    layoutEnvelopeControls (env1Controls, env1Area);
-    layoutEnvelopeControls (env2Controls, env2Area);
-
-    area.removeFromTop (12);
-
-    auto lfoRow = area.removeFromTop (162);
-    auto lfo1Area = lfoRow.removeFromLeft (lfoRow.getWidth() / 2).reduced (8, 0);
-    auto lfo2Area = lfoRow.reduced (8, 0);
-    layoutLFOControls (lfo1Controls, lfo1Area);
-    layoutLFOControls (lfo2Controls, lfo2Area);
-
-    area.removeFromTop (12);
-
-    modMatrixTitle.setBounds (area.removeFromTop (20));
-    area.removeFromTop (4);
-    for (auto& slot : modSlotControls)
+    // --- Sección de oscilador: info display + selector proporcional + 5 perillas ---
+    auto layoutOscSection = [] (juce::Rectangle<int> area,
+                                InfoDisplay& info,
+                                ButtonSelector& waveSel,
+                                RotaryKnob& kPos, RotaryKnob& kOct, RotaryKnob& kSemi,
+                                RotaryKnob& kFine, RotaryKnob& kLevel)
     {
-        layoutModSlotControls (slot, area.removeFromTop (28));
-        area.removeFromTop (4);
+        auto inner = area.reduced (8);
+
+        // Fila superior: info display alineado a la derecha
+        auto titleRow = inner.removeFromTop (15);
+        info.setBounds (titleRow.removeFromRight (155).reduced (0, 1));
+
+        inner.removeFromTop (1);
+
+        // Selector de onda: 30% del ancho disponible (ahora escala horizontalmente)
+        const int selW = (int) (inner.getWidth() * 0.30f);
+        auto selZone = inner.removeFromLeft (selW).reduced (2, 3);
+        waveSel.setBounds (selZone);
+
+        inner.removeFromLeft (4);
+        const int kw = inner.getWidth() / 5;
+        kPos  .setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        kOct  .setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        kSemi .setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        kFine .setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        kLevel.setBounds (inner.reduced (1, 0));
+    };
+
+    layoutOscSection (osc1Area, osc1Info, *osc1Wave,
+                      osc1Pos, osc1Oct, osc1Semi, osc1Fine, osc1Level);
+    layoutOscSection (osc2Area, osc2Info, *osc2Wave,
+                      osc2Pos, osc2Oct, osc2Semi, osc2Fine, osc2Level);
+
+    // --- Filtro: info display + 3 botones tipo + 4 perillas ---
+    {
+        auto inner = filterArea.reduced (8);
+        auto titleRow = inner.removeFromTop (15);
+        filterInfo.setBounds (titleRow.removeFromRight (155).reduced (0, 1));
+
+        inner.removeFromTop (1);
+
+        const int selW = (int) (inner.getWidth() * 0.22f);
+        auto selZone = inner.removeFromLeft (selW).reduced (2, 3);
+        filterType->setBounds (selZone);
+
+        inner.removeFromLeft (4);
+        const int kw = inner.getWidth() / 4;
+        filterCutoff  .setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        filterReso    .setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        filterEnvAmt  .setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        filterKeyTrack.setBounds (inner.reduced (1, 0));
     }
 
-    area.removeFromTop (12);
+    // --- AMP ENV ---
+    {
+        auto inner = ampEnvArea.reduced (8);
+        auto titleRow = inner.removeFromTop (15);
+        ampEnvInfo.setBounds (titleRow.removeFromRight (155).reduced (0, 1));
 
-    auto effectsRow = area.removeFromTop (162);
-    const int quarterWidth = effectsRow.getWidth() / 4;
-    auto driveArea   = effectsRow.removeFromLeft (quarterWidth).reduced (6, 0);
-    auto chorusArea  = effectsRow.removeFromLeft (quarterWidth).reduced (6, 0);
-    auto delayArea   = effectsRow.removeFromLeft (quarterWidth).reduced (6, 0);
-    auto reverbArea  = effectsRow.reduced (6, 0);
+        inner.removeFromTop (1);
+        const int kw = inner.getWidth() / 4;
+        ampA.setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        ampD.setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        ampS.setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        ampR.setBounds (inner.reduced (1, 0));
+    }
 
-    layoutEffectControls (driveControls, driveArea);
-    layoutEffectControls (chorusControls, chorusArea);
-    layoutEffectControls (delayControls, delayArea);
-    layoutEffectControls (reverbControls, reverbArea);
+    // --- FILTER ENV ---
+    {
+        auto inner = filtEnvArea.reduced (8);
+        auto titleRow = inner.removeFromTop (15);
+        filtEnvInfo.setBounds (titleRow.removeFromRight (155).reduced (0, 1));
+
+        inner.removeFromTop (1);
+        const int kw = inner.getWidth() / 4;
+        filtA.setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        filtD.setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        filtS.setBounds (inner.removeFromLeft (kw).reduced (1, 0));
+        filtR.setBounds (inner.reduced (1, 0));
+    }
+
+    // --- MASTER ---
+    {
+        auto inner = masterArea.reduced (8);
+        auto titleRow = inner.removeFromTop (15);
+        masterInfo.setBounds (titleRow.reduced (0, 1));
+
+        inner.removeFromTop (1);
+        master.setBounds (inner.reduced (2, 0));
+    }
 }
